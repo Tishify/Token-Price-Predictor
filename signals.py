@@ -1,41 +1,51 @@
 import pandas as pd
 import re
-from io import StringIO
+
+# --- Loading and validation ---
+
+def load_signals(path: str) -> pd.DataFrame:
+    if path.lower().endswith(('.xls', '.xlsx')):
+        df = pd.read_excel(path)
+    else:
+        df = pd.read_csv(path)
+    df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_')
+    df['time'] = pd.to_datetime(df['time'])
+    required = {'time','wallet','operation','pct','volume_$','balance_$','price'}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing columns: {missing}")
+    return df
+
+# --- Text parsing fallback ---
 
 def parse_text_signals(text: str) -> pd.DataFrame:
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     rows = []
     pattern = re.compile(r"(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})\s+(buy|sell)\s+([\d.,]+)(?:\s+([\d.,]+))?", re.IGNORECASE)
     for ln in lines:
-        m = pattern.search(ln.replace(",", "."))
+        m = pattern.search(ln.replace(',', '.'))
         if not m:
             continue
         date, tm, op, pct, price = m.groups()
         rows.append({
-            "time": f"{date} {tm}",
-            "operation": op.lower(),
-            "pct": float(pct),
-            "price": float(price) if price else None
+            'time': f"{date} {tm}",
+            'wallet': 'unknown',
+            'operation': op.lower(),
+            'pct': float(pct),
+            'volume_$': None,
+            'balance_$': None,
+            'price': float(price) if price else None
         })
     return pd.DataFrame(rows)
 
-def parse_file_signals(path: str) -> pd.DataFrame:
-    if path.endswith(".csv"):
-        return pd.read_csv(path)
-    return pd.read_excel(path)
+# --- Resampling into candles ---
 
-def build_curve_from_signals(df_sig: pd.DataFrame, start_price: float = 0.01,
-                             step_pct: float = 1.0) -> pd.DataFrame:
-    df_sig = df_sig.sort_values("time")
-    if "price" in df_sig.columns and df_sig["price"].notna().any():
-        return df_sig[["time", "price"]]
-    price = start_price
-    prices = []
-    for _, r in df_sig.iterrows():
-        if r["operation"] == "buy":
-            price *= (1 + step_pct/100)
-        else:
-            price *= (1 - step_pct/100)
-        prices.append(price)
-    out = pd.DataFrame({"time": pd.to_datetime(df_sig["time"]), "price": prices})
-    return out
+def resample_signals_to_candles(df: pd.DataFrame, interval: str) -> pd.DataFrame:
+    alias = {'5m':'5T','15m':'15T','30m':'30T','4h':'4H'}[interval]
+    df = df.set_index('time')
+    ohlc = df['price'].resample(alias).agg(open='first', high='max', low='min', close='last')
+    volume = df['volume_$'].resample(alias).sum().rename('volume')
+    wallet_count = df['wallet'].resample(alias).nunique().rename('wallet_count')
+    candles = pd.concat([ohlc, volume, wallet_count], axis=1)
+    candles = candles.dropna(subset=['open']).reset_index()
+    return candles
