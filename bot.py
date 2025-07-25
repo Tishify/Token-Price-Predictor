@@ -1,4 +1,5 @@
 import os
+import re
 import tempfile
 from datetime import datetime, timedelta
 from io import BytesIO
@@ -19,9 +20,8 @@ from plot import (
     fig_to_html_bytes, fig_to_pdf_bytes
 )
 
-# === STATES for /predict ===
+# === STATES for /predict and /chart ===
 PRED_START_PRICE, PRED_POINTS, PRED_GAP, PRED_VOL = range(4)
-# === STATES for /chart ===
 CHOOSING_INTERVAL, WAITING_SIGNALS = range(4, 6)
 
 BOT_TOKEN = "8126937750:AAHhLOYTAexE0qQY3P55kcyBIUmx5JWC1ao" # set your token in env
@@ -29,33 +29,60 @@ BOT_TOKEN = "8126937750:AAHhLOYTAexE0qQY3P55kcyBIUmx5JWC1ao" # set your token in
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Я бот для предсказания цен и построения графиков по сигналам.\n"
-        "Используй /predict для генерации цены или /chart для построения свечей по сигналам."
+        "Используй /predict для генерации цены или /chart для свечей по сигналам."
     )
     return ConversationHandler.END
 
 # -------- PREDICT FLOW ----------
 async def predict_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Начальная цена?")
+    await update.message.reply_text("1) Введи начальную цену (цифры, можно 0.01 или 0,01):")
     return PRED_START_PRICE
 
-async def pred_start_price(update, context):
-    context.user_data["start_price"] = float(update.message.text)
-    await update.message.reply_text("Сколько точек (например 50)?")
+async def pred_start_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text.strip()
+    # Normalize decimal and remove non-numeric chars
+    txt = txt.replace(',', '.').replace('$', '')
+    txt = re.sub(r"[^0-9.]", "", txt)
+    try:
+        price = float(txt)
+    except ValueError:
+        await update.message.reply_text(
+            "Неверный формат цены. Введите число, например 0.01 или 1.5"
+        )
+        return PRED_START_PRICE
+    context.user_data["start_price"] = price
+    await update.message.reply_text("2) Сколько точек (целое число, пример: 50):")
     return PRED_POINTS
 
-async def pred_points(update, context):
-    context.user_data["points"] = int(update.message.text)
-    await update.message.reply_text("Интервал между точками в минутах (например 10)?")
+async def pred_points(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text.strip()
+    if not txt.isdigit():
+        await update.message.reply_text("Введите целое число для точек, например 50.")
+        return PRED_POINTS
+    context.user_data["points"] = int(txt)
+    await update.message.reply_text("3) Интервал между точками в минутах (число, пример: 10):")
     return PRED_GAP
 
-async def pred_gap(update, context):
-    context.user_data["gap"] = int(update.message.text)
-    await update.message.reply_text("Волатильность в % (амплитуда шага, по умолчанию 2)?")
+async def pred_gap(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text.strip()
+    if not txt.isdigit():
+        await update.message.reply_text("Введите целое число минут, например 10.")
+        return PRED_GAP
+    context.user_data["gap"] = int(txt)
+    await update.message.reply_text(
+        "4) Волатильность в % (десятичное число, по умолчанию 2):"
+    )
     return PRED_VOL
 
-async def pred_vol(update, context):
-    txt = update.message.text.strip()
-    context.user_data["vol"] = float(txt) if txt else 2.0
+async def pred_vol(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text.strip().replace(',', '.')
+    try:
+        vol = float(txt) if txt else 2.0
+    except ValueError:
+        await update.message.reply_text("Введите число для волатильности, например 2 или 0.5")
+        return PRED_VOL
+    context.user_data["vol"] = vol
+
     u = context.user_data
     start_time = datetime.now()
     end_time = start_time + timedelta(minutes=u["gap"] * (u["points"] - 1))
@@ -75,34 +102,34 @@ async def chart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def chart_interval_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    interval = q.data
-    context.user_data["interval"] = interval
-    await q.edit_message_text(f"Интервал установлен: {interval}. Пришлите CSV или XLSX файл с сигналами.")
+    context.user_data["interval"] = q.data
+    await q.edit_message_text(
+        f"Интервал {q.data} выбран. Пришлите CSV или XLSX файл с сигналами."
+    )
     return WAITING_SIGNALS
 
 async def chart_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # загрузка сигналов
     if update.message.document:
         file = await update.message.document.get_file()
-        tmp = tempfile.NamedTemporaryFile(delete=False).name
+        # preserve extension for correct parsing
+        orig = update.message.document.file_name
+        suffix = os.path.splitext(orig)[1]
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix).name
         await file.download_to_drive(tmp)
         df = load_signals(tmp)
     else:
-        text = update.message.text
-        df = parse_text_signals(text)
+        df = parse_text_signals(update.message.text)
 
-    candles = resample_signals_to_candles(df, context.user_data["interval"])
+    candles = resample_signals_to_candles(df, context.user_data.get("interval", "30m"))
     if candles.empty:
-        await update.message.reply_text("Нет данных для выбранного интервала.")
+        await update.message.reply_text("В выбранном интервале нет данных.")
         return ConversationHandler.END
 
     fig = create_candlestick_figure(candles)
     html_b = fig_to_html_bytes(fig)
     pdf_b = fig_to_pdf_bytes(fig)
-
     bio_html = BytesIO(html_b); bio_html.name = "chart.html"; bio_html.seek(0)
     bio_pdf  = BytesIO(pdf_b);  bio_pdf.name  = "chart.pdf";  bio_pdf.seek(0)
-
     await update.message.reply_document(document=bio_html, filename=bio_html.name)
     await update.message.reply_document(document=bio_pdf,  filename=bio_pdf.name)
     return ConversationHandler.END
@@ -116,18 +143,16 @@ async def send_curve(update_or_q, df, prefix: str):
     if df.empty:
         await update_or_q.message.reply_text("Нет данных для графика.")
         return
-    # Выбираем тип графика по наличию колонок
     if 'open' in df.columns:
-        fig = create_candlestick_figure(df)
+        from plot import create_candlestick_figure as create_fig
     else:
-        fig = create_line_figure(df)
+        from plot import create_line_figure as create_fig
+    fig = create_fig(df)
 
     html_b = fig_to_html_bytes(fig)
     pdf_b = fig_to_pdf_bytes(fig)
-
     bio_html = BytesIO(html_b); bio_html.name = f"{prefix}.html"; bio_html.seek(0)
     bio_pdf  = BytesIO(pdf_b);  bio_pdf.name  = f"{prefix}.pdf";  bio_pdf.seek(0)
-
     await update_or_q.message.reply_document(document=bio_html, filename=bio_html.name)
     await update_or_q.message.reply_document(document=bio_pdf,  filename=bio_pdf.name)
 
