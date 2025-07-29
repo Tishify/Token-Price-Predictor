@@ -1,11 +1,8 @@
-import os
 import pandas as pd
 import re
-
-# --- Loading and validation ---
+import os
 
 def load_signals(path: str) -> pd.DataFrame:
-    # Read XLSX if extension indicates, else default to CSV
     ext = os.path.splitext(path)[1].lower()
     if ext in ('.xls', '.xlsx'):
         df = pd.read_excel(path)
@@ -19,7 +16,6 @@ def load_signals(path: str) -> pd.DataFrame:
         raise ValueError(f"Missing columns: {missing}")
     return df
 
-# --- Text parsing fallback ---
 
 def parse_text_signals(text: str) -> pd.DataFrame:
     lines = [l.strip() for l in text.splitlines() if l.strip()]
@@ -41,15 +37,12 @@ def parse_text_signals(text: str) -> pd.DataFrame:
         })
     return pd.DataFrame(rows)
 
-# --- Resampling into candles ---
 
 def resample_signals_to_candles(df: pd.DataFrame, interval: str) -> pd.DataFrame:
     alias_map = {'5m':'5min','15m':'15min','30m':'30min','4h':'4H'}
     alias = alias_map[interval]
     df = df.set_index('time')
-    ohlc = df['price'].resample(alias).agg(
-        open='first', high='max', low='min', close='last'
-    )
+    ohlc = df['price'].resample(alias).agg(open='first', high='max', low='min', close='last')
     volume = df['volume_$'].resample(alias).sum().rename('volume')
     wallet_count = df['wallet'].resample(alias).nunique().rename('wallet_count')
     candles = pd.concat([ohlc, volume, wallet_count], axis=1)
